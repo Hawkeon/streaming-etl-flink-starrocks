@@ -1,0 +1,14 @@
+CLAUDE.md
+.claude/
+graphify-out/cache/
+tmp_*.sql
+benchmark/__pycache__/
+*.pyc
+infrastructure/lib/
+*.jar
+*.csv
+dataset/
+data/
+venv/
+.venv/
+__pycache__/

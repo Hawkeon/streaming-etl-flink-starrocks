@@ -1,0 +1,3 @@
+pyfluss[pyarrow]
+polars
+pymysql

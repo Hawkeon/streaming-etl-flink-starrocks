@@ -1,0 +1,254 @@
+services:
+  #begin RustFS (S3-compatible storage)
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.83
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
+      - RUSTFS_CONSOLE_ENABLE=true
+    volumes:
+      - rustfs-data:/data
+    command: /data
+  rustfs-init:
+    image: minio/mc
+    depends_on:
+      - rustfs
+    entrypoint: >
+      /bin/sh -c " until mc alias set rustfs http://rustfs:9000 rustfsadmin
+      rustfsadmin; do
+        echo 'Waiting for RustFS...';
+        sleep 1;
+      done; mc mb --ignore-existing rustfs/fluss; "
+  #end
+  #begin Fluss cluster
+  coordinator-server:
+    image: apache/fluss:0.9.0-incubating
+    command: coordinatorServer
+    ports:
+      - "9123:9123"
+    depends_on:
+      - zookeeper
+      - rustfs-init
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://0.0.0.0:9123
+        advertised.listeners: FLUSS://coordinator-server:9123
+        remote.data.dir: s3://fluss/remote-data
+        s3.endpoint: http://rustfs:9000
+        s3.access-key: rustfsadmin
+        s3.secret-key: rustfsadmin
+        s3.region: us-east-1
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/rustfsadmin
+        s3.assumed.role.sts.endpoint: http://rustfs:9000
+  tablet-server:
+    image: apache/fluss:0.9.0-incubating
+    command: tabletServer
+    depends_on:
+      - coordinator-server
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://0.0.0.0:9123
+        advertised.listeners: FLUSS://tablet-server:9123
+        data.dir: /tmp/fluss/data
+        remote.data.dir: s3://fluss/remote-data
+        s3.endpoint: http://rustfs:9000
+        s3.access-key: rustfsadmin
+        s3.secret-key: rustfsadmin
+        s3.region: us-east-1
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/rustfsadmin
+        s3.assumed.role.sts.endpoint: http://rustfs:9000
+  zookeeper:
+    restart: always
+    image: zookeeper:3.9.2
+  #end
+  #begin Flink cluster
+  jar-downloader:
+    image: alpine:latest
+    container_name: jar-downloader
+    volumes:
+      - ./lib:/tmp/lib
+    entrypoint: [ "sh", "-c" ]
+    command:
+      - |
+        apk add --no-cache curl;
+        mkdir -p /tmp/lib;
+        cd /tmp/lib;
+
+        # Định nghĩa version chuẩn cho 1.19
+        FLUSS_V="0.9.0-incubating";
+        SR_V="1.2.9_flink-1.19";
+        FLINK_V="1.19.0"; 
+
+        echo "--- Đang tải JARs cho Flink $$FLINK_V ---";
+
+        # Tải Fluss Connector
+        curl -fLO https://repo1.maven.org/maven2/org/apache/fluss/fluss-flink-1.19/0.9.0-incubating/fluss-flink-1.19-0.9.0-incubating.jar;
+
+        # Tải StarRocks Connector
+        curl -fLO https://repo1.maven.org/maven2/com/starrocks/flink-connector-starrocks/1.2.14_flink-1.19/flink-connector-starrocks-1.2.14_flink-1.19.jar;
+
+        # Tải S3 FS Hadoop
+        curl -fLO https://repo1.maven.org/maven2/org/apache/flink/flink-s3-fs-hadoop/1.19.0/flink-s3-fs-hadoop-1.19.0.jar;
+
+        # Tải thêm Hadoop AWS (Cần thiết để kết nối RustFS qua S3A)
+        curl -fLO https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar;
+
+        echo "--- Đang tải JARs cho Flink $$FLINK_V ---";
+        ls -lh /tmp/lib;
+  jobmanager:
+    image: flink:${FLINK_VERSION}
+    ports:
+      - "8083:8081"
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+    entrypoint:
+      [
+        "sh",
+        "-c",
+        "cp -v /tmp/lib/*.jar /opt/flink/lib && chown -v flink:flink
+          /opt/flink/lib/*.jar && mkdir -p /opt/flink/plugins/s3-fs-hadoop && mv
+          -v /opt/flink/lib/flink-s3-fs-hadoop-*.jar
+          /opt/flink/plugins/s3-fs-hadoop/ && chown -v flink:flink
+          /opt/flink/plugins/s3-fs-hadoop/*.jar && exec /docker-entrypoint.sh
+          jobmanager",
+      ]
+    depends_on:
+      - jar-downloader
+    volumes:
+      - ./lib:/tmp/lib
+  taskmanager:
+    image: flink:${FLINK_VERSION}
+    restart: on-failure
+    depends_on:
+      - jobmanager
+      - jar-downloader
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 10
+        taskmanager.memory.process.size: 4096m
+        taskmanager.memory.framework.off-heap.size: 512m
+        state.backend: rocksdb
+        state.backend.incremental-checkpoints: true
+        execution.checkpointing.interval: 30s
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+    entrypoint:
+      [
+        "sh",
+        "-c",
+        "cp -v /tmp/lib/*.jar /opt/flink/lib && chown -v flink:flink
+          /opt/flink/lib/*.jar && mkdir -p /opt/flink/plugins/s3-fs-hadoop && mv
+          -v /opt/flink/lib/flink-s3-fs-hadoop-*.jar
+          /opt/flink/plugins/s3-fs-hadoop/ && chown -v flink:flink
+          /opt/flink/plugins/s3-fs-hadoop/*.jar && exec /docker-entrypoint.sh
+          taskmanager",
+      ]
+    volumes:
+      - ./lib:/tmp/lib
+  sql-client:
+    image: flink:${FLINK_VERSION}
+    depends_on:
+      - jobmanager
+      - jar-downloader
+    tty: true
+    stdin_open: true
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+    entrypoint:
+      [
+        "/usr/bin/bash",
+        "-c",
+        "cp -v /tmp/lib/*.jar /opt/flink/lib && chown -v flink:flink
+          /opt/flink/lib/*.jar && mkdir -p /opt/flink/plugins/s3-fs-hadoop && mv
+          -v /opt/flink/lib/flink-s3-fs-hadoop-*.jar
+          /opt/flink/plugins/s3-fs-hadoop/ && chown -v flink:flink
+          /opt/flink/plugins/s3-fs-hadoop/*.jar && echo 'Waiting for
+          JobManager...' && while ! (echo > /dev/tcp/jobmanager/8081) >/dev/null
+          2>&1; do sleep 1; done && /docker-entrypoint.sh bin/sql-client.sh && tail -f /dev/null",
+      ]
+    volumes:
+      - ./lib:/tmp/lib
+      - ../sql:/opt/flink/init
+      - ../processing:/opt/flink/processing
+      - ./sql-client-init.sh:/opt/flink/bin/sql-client-init.sh
+  #end
+  #begin StarRocks
+  starrocks-fe:
+    image: starrocks/fe-ubuntu:3.3.1
+    hostname: starrocks-fe
+    command: ["bash", "-c", "cd /opt/starrocks && ./fe_entrypoint.sh starrocks-fe"]
+    ports:
+      - "8030:8030"
+      - "9030:9030"
+    environment:
+      - FE_CONF_http_port=8030
+      - FE_CONF_query_port=9030
+      - FE_CONF_edition=community
+    volumes:
+      - starrocks-fe-data:/opt/starrocks/fe/meta
+      - ../sql/starrocks-schema.sql:/opt/starrocks-init/starrocks-schema.sql:ro
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8030/api/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+  starrocks-be:
+    image: starrocks/be-ubuntu:3.3.1
+    hostname: starrocks-be
+    entrypoint: ["bash", "-c", "cd /opt/starrocks && ./be_entrypoint.sh starrocks-fe"]
+    environment:
+      - BE_CONF_storage_root_path=/opt/starrocks/be/storage
+      - BE_CONF_be_port=8040
+      - BE_CONF_be_http_port=8040
+      - HOST_TYPE=IP
+    volumes:
+      - starrocks-be-data:/opt/starrocks/be/storage
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+    restart: on-failure:5
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8040/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+  starrocks-init:
+    image: mysql:8.0
+    depends_on:
+      starrocks-be:
+        condition: service_healthy
+    volumes:
+      - ../sql/starrocks-schema.sql:/opt/starrocks-init/starrocks-schema.sql:ro
+    restart: "no"
+    command: >
+      /bin/sh -c " sleep 5 && mysql -h starrocks-fe -P 9030 -u root
+      --default-auth=mysql_native_password < /opt/starrocks-init/starrocks-schema.sql"
+  #end
+  producer:
+    build:
+      context: ../producers/python-gen
+    depends_on:
+      - coordinator-server
+      - tablet-server
+    volumes:
+      - ../producers/Track_Data_Set:/app/data
+
+volumes:
+  rustfs-data:
+  starrocks-fe-data:
+  starrocks-be-data:
